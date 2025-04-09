@@ -265,23 +265,56 @@ class MkvTrackFilter:
         return True
 
     def _find_mkv_files(self, input_path: Path) -> List[Path]:
-        """Finds MKV files based on input path and recursion flag."""
+        """Finds MKV files based on the input path and recursive flag."""
         mkv_files: List[Path] = []
-        if input_path.is_file():
-            if input_path.suffix.lower() == ".mkv":
-                mkv_files.append(input_path)
-            else:
-                self.logger.warning(f"Input '{input_path}' is not an MKV file.")
-        elif input_path.is_dir():
-            scan_type = (
-                "recursively" if self.args.recursive else "non-recursively"
-            )
-            self.logger.info(f"Scanning directory: {input_path} ({scan_type})")
-            pattern = "**/*.mkv" if self.args.recursive else "*.mkv"
-            mkv_files = sorted(list(input_path.glob(pattern)))
-            self.logger.info(f"Found {len(mkv_files)} MKV files.")
-        else:
-            self.logger.error(f"Input path '{input_path}' not found.")
+        try:
+            # Resolve the path immediately for consistency and existence check
+            # strict=True will raise FileNotFoundError if path doesn't exist/inaccessible
+            resolved_path = input_path.resolve(strict=True)
+            self.logger.debug(f"Resolved input path: {resolved_path}")
+
+            if resolved_path.is_file():
+                if resolved_path.suffix.lower() == ".mkv":
+                    mkv_files.append(resolved_path)
+                else:
+                    self.logger.warning(
+                        f"Input path '{resolved_path}' is a file but not an MKV."
+                    )
+            elif resolved_path.is_dir():
+                scan_type = (
+                    "recursively" if self.args.recursive else "non-recursively"
+                )
+                self.logger.info(
+                    f"Scanning directory: {resolved_path} ({scan_type})"
+                )
+                pattern = "**/*.mkv" if self.args.recursive else "*.mkv"
+                # Use generator and immediately convert to list, then sort
+                mkv_files = sorted(list(resolved_path.glob(pattern)))
+                if mkv_files:
+                    self.logger.info(
+                        f"Found {len(mkv_files)} MKV files in {resolved_path}."
+                    )
+                else:
+                    # Log if directory exists but no MKVs found matching pattern
+                    self.logger.warning(
+                        f"No MKV files found matching pattern in '{resolved_path}'."
+                    )
+            # No 'else' needed here because resolve(strict=True) handles non-existence
+
+        except FileNotFoundError:
+             # Log error if resolve(strict=True) fails
+             self.logger.error(
+                 f"Input path '{input_path}' not found or inaccessible."
+             )
+             # mkv_files remains empty
+        except Exception as e:
+             # Catch other potential errors during path processing/globbing
+             self.logger.error(
+                 f"Error processing input path '{input_path}': {e}",
+                 exc_info=True # Include traceback for unexpected errors
+             )
+             # mkv_files remains empty
+
         return mkv_files
 
     def _get_tmdb_language(self, tmdb_id: int) -> Optional[str]:
@@ -524,24 +557,32 @@ class MkvTrackFilter:
     def _filter_subtitle_tracks(
         self, tracks: List[Dict[str, Any]], preferred_languages: Set[str]
     ) -> List[int]:
-        """Selects subtitle tracks, processing each preferred language independently."""
+        """
+        Selects subtitle tracks based on language, forced status, SDH status,
+        commentary, and format. Processes EACH preferred language independently.
+        Default keeps all formats in best group; --filter-sub-formats enables format ranking.
+        Falls back to 'und' if no preferred tracks kept.
+        """
         self.logger.debug(
             "Filtering subtitle tracks. Preferred languages: "
             f"{preferred_languages or '{None}'}"
         )
-        final_kept_ids: Set[int] = set()
+        final_kept_ids: Set[int] = set()  # Final set of IDs to keep
 
-        # --- Step 1: Process each preferred language ---
+        # --- Step 1: Process each preferred language individually ---
         for pref_lang in preferred_languages:
             self.logger.debug(f"Processing preferred language: '{pref_lang}'")
+            # Buckets for *this specific language*
             forced_this_lang = []
             regular_non_sdh_this_lang = []
             regular_sdh_this_lang = []
 
-            # Categorize tracks for this lang
+            # Inner loop: Categorize tracks *for this preferred language*
             for track in tracks:
                 properties = track.get("properties", {})
                 lang = properties.get("language", LANG_UND).lower()
+
+                # Skip if not subtitle or not the current preferred language
                 if track.get("type") != TYPE_SUBTITLES or lang != pref_lang:
                     continue
 
@@ -549,13 +590,17 @@ class MkvTrackFilter:
                 track_name_full = properties.get("track_name", "")
                 codec = track.get("codec", "Unknown")
 
+                # Check for commentary using the updated _is_commentary method
+                # It will now handle the logging internally if it returns True
                 if self._is_commentary(track, TYPE_SUBTITLES):
-                    continue # Logged inside _is_commentary
+                    continue  # Skip commentary tracks
 
+                # Check SDH and Forced status for non-commentary tracks
                 is_sdh = bool(
                     properties.get(SUBTITLE_FLAG_HEARING_IMPAIRED)
                 ) or any(
-                    kw in track_name_full.lower() for kw in SUBTITLE_SDH_KEYWORDS
+                    kw in track_name_full.lower()
+                    for kw in SUBTITLE_SDH_KEYWORDS
                 )
                 is_forced = properties.get(SUBTITLE_FLAG_FORCED, False)
                 track_info = {
@@ -565,7 +610,7 @@ class MkvTrackFilter:
 
                 if is_forced:
                     forced_this_lang.append(track_info)
-                    continue # Handle forced separately
+                    continue  # Handle forced separately
 
                 # Log non-forced, non-commentary track being processed
                 reason_str = " (Reason: SDH)" if is_sdh else ""
@@ -578,7 +623,8 @@ class MkvTrackFilter:
                 else:
                     regular_non_sdh_this_lang.append(track_info)
 
-            # Process results for this language
+            # --- Process results for this preferred language ---
+            # Keep all found forced tracks for this language
             kept_forced_ids_this_lang = {t["id"] for t in forced_this_lang}
             if kept_forced_ids_this_lang:
                 self.logger.debug(
@@ -587,7 +633,7 @@ class MkvTrackFilter:
                 )
                 final_kept_ids.update(kept_forced_ids_this_lang)
 
-            # Select best regular track group (non-SDH > SDH)
+            # Select best regular track group for this language (non-SDH > SDH)
             selected_regular_group: List[Dict[str, Any]] = []
             group_desc = ""
             if regular_non_sdh_this_lang:
@@ -597,42 +643,59 @@ class MkvTrackFilter:
                 selected_regular_group = regular_sdh_this_lang
                 group_desc = "SDH"
 
-            # Apply format filter if a regular group was selected
+            # Apply format filter or keep all from group based on flag
             if selected_regular_group:
                 self.logger.debug(
                     f"Selected regular {group_desc} group for '{pref_lang}' "
-                    f"({len(selected_regular_group)}). Filtering..."
+                    f"({len(selected_regular_group)})."
                 )
-                best_regular_ids_this_lang = set()
-                best_format_level = len(SUBTITLE_FORMAT_ORDER)
-                for track_info in selected_regular_group:
-                    track_id = track_info["id"]; codec = track_info["codec"]
-                    try: level = SUBTITLE_FORMAT_ORDER.index(codec)
-                    except ValueError: level = len(SUBTITLE_FORMAT_ORDER)
+                ids_to_add_this_lang = set()
+                # Apply format filtering ONLY if flag is set
+                if self.args.filter_sub_formats:
+                    self.logger.debug("Filtering by format preference...")
+                    best_format_level = len(SUBTITLE_FORMAT_ORDER)
+                    for track_info in selected_regular_group:
+                        track_id = track_info["id"]
+                        codec = track_info["codec"]
+                        try: level = SUBTITLE_FORMAT_ORDER.index(codec)
+                        except ValueError: level = len(SUBTITLE_FORMAT_ORDER)
 
-                    if level < best_format_level:
-                        best_regular_ids_this_lang = {track_id}
-                        best_format_level = level
-                    elif level == best_format_level:
-                        best_regular_ids_this_lang.add(track_id)
+                        if level < best_format_level:
+                            ids_to_add_this_lang = {track_id}
+                            best_format_level = level
+                        elif level == best_format_level:
+                            ids_to_add_this_lang.add(track_id)
+                    if not ids_to_add_this_lang:
+                        self.logger.warning(
+                            f"No regular {group_desc} tracks kept for '{pref_lang}' "
+                            "after format filter."
+                        )
+                # Default: Keep ALL formats in the selected group
+                else:
+                    ids_to_add_this_lang = {
+                        t["id"] for t in selected_regular_group
+                    }
+                    self.logger.debug(
+                        f"Keeping all {len(ids_to_add_this_lang)} track(s) from "
+                        f"regular {group_desc} group for '{pref_lang}' "
+                        "(format filter disabled)."
+                    )
 
-                if best_regular_ids_this_lang:
+                if ids_to_add_this_lang:
                     self.logger.debug(
                         f"Keeping best regular {group_desc} track(s) for "
-                        f"'{pref_lang}': {sorted(list(best_regular_ids_this_lang))}"
+                        f"'{pref_lang}': {sorted(list(ids_to_add_this_lang))}"
                     )
-                    final_kept_ids.update(best_regular_ids_this_lang)
-                else:
-                    self.logger.warning(
-                        f"No regular {group_desc} tracks kept for '{pref_lang}' "
-                        "after format filter."
-                    )
+                    final_kept_ids.update(ids_to_add_this_lang)
             else:
                 self.logger.debug(f"No regular tracks found for '{pref_lang}'.")
 
         # --- Step 2: Fallback to Undetermined ('und') if NO preferred tracks kept ---
         if not final_kept_ids:
-            self.logger.info("No preferred subs kept. Checking 'und' non-SDH.")
+            self.logger.info(
+                "No preferred language subtitles kept. "
+                "Checking for Undetermined ('und') non-SDH tracks."
+            )
             und_non_sdh_tracks = []
             for track in tracks:
                 properties = track.get("properties", {})
@@ -652,20 +715,42 @@ class MkvTrackFilter:
                                 "codec": track.get("codec", "Unknown")
                             })
 
-            if und_non_sdh_tracks: # Apply format filter
-                self.logger.debug(f"Found {len(und_non_sdh_tracks)} 'und' non-SDH tracks.")
-                best_und_ids = set(); best_format_level = len(SUBTITLE_FORMAT_ORDER)
-                for track_info in und_non_sdh_tracks:
-                    track_id = track_info["id"]; codec = track_info["codec"]
-                    try: level = SUBTITLE_FORMAT_ORDER.index(codec)
-                    except ValueError: level = len(SUBTITLE_FORMAT_ORDER)
-                    if level < best_format_level: best_und_ids = {track_id}; best_format_level = level
-                    elif level == best_format_level: best_und_ids.add(track_id)
-                if best_und_ids:
-                    self.logger.debug(f"Keeping best 'und' track(s): {sorted(list(best_und_ids))}")
-                    final_kept_ids.update(best_und_ids)
-                else: self.logger.warning("No 'und' tracks kept after format filtering.")
-            else: self.logger.info("No suitable 'und' non-SDH tracks found.")
+            if und_non_sdh_tracks:
+                self.logger.debug(
+                    f"Found {len(und_non_sdh_tracks)} 'und' non-SDH tracks."
+                )
+                ids_to_add_und = set()
+                if self.args.filter_sub_formats: # Apply format filter if enabled
+                    self.logger.debug(
+                        "Filtering 'und' tracks by format preference..."
+                    )
+                    best_format_level = len(SUBTITLE_FORMAT_ORDER)
+                    for track_info in und_non_sdh_tracks:
+                        track_id = track_info["id"]; codec = track_info["codec"]
+                        try: level = SUBTITLE_FORMAT_ORDER.index(codec)
+                        except ValueError: level = len(SUBTITLE_FORMAT_ORDER)
+                        if level < best_format_level:
+                            ids_to_add_und = {track_id}; best_format_level = level
+                        elif level == best_format_level:
+                            ids_to_add_und.add(track_id)
+                    if not ids_to_add_und:
+                        self.logger.warning(
+                            "No 'und' tracks kept after format filtering."
+                        )
+                else: # Keep all 'und' formats if filter disabled
+                    ids_to_add_und = {t["id"] for t in und_non_sdh_tracks}
+                    self.logger.debug(
+                        f"Keeping all {len(ids_to_add_und)} 'und' track(s) "
+                        "(format filter disabled)."
+                    )
+
+                if ids_to_add_und:
+                    self.logger.debug(
+                        f"Keeping best 'und' track(s): {sorted(list(ids_to_add_und))}"
+                    )
+                    final_kept_ids.update(ids_to_add_und)
+            else:
+                self.logger.info("No suitable 'und' non-SDH tracks found.")
 
         # --- Step 3: Return combined IDs ---
         final_sorted_list = sorted(list(final_kept_ids))
@@ -1159,6 +1244,7 @@ def main():
     io_group = parser.add_argument_group('Input/Output Options')
     behavior_group = parser.add_argument_group('Processing Behavior')
     lang_group = parser.add_argument_group('Language Selection')
+    sub_group = parser.add_argument_group('Subtitle Filtering Options')
     log_group = parser.add_argument_group('Logging Options')
 
     # Define Arguments
@@ -1197,6 +1283,10 @@ def main():
         help="Add movie's original language (from TMDb) to preferred list "
              "FOR AUDIO tracks."
     )
+    sub_group.add_argument(
+        "--filter-sub-formats", action="store_true", default=False, 
+        help="Enable filtering subtitles by preferred format order (SSA/ASS > SRT > WebVTT > PGS > VobSub). " \
+             "Default keeps best group (non-SDH > SDH) regardless of format.")
     log_group.add_argument(
         "--log-dir", type=Path, default=DEFAULT_LOG_DIR, metavar="DIR",
         help="Directory for log files."
